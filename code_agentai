@@ -1,0 +1,167 @@
+import os
+import json
+import pandas as pd
+import pandasql as psql
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema
+from langchain.chains import LLMChain
+
+# --------------------------
+# 1. Setup Gemini
+# --------------------------
+os.environ["GOOGLE_API_KEY"] = ""
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
+
+# --------------------------
+# 2. Dummy Data + Schema
+# --------------------------
+data = pd.DataFrame({
+    "date": pd.to_datetime([
+        "2024-01-10","2024-02-12","2024-03-05","2024-03-20",
+        "2024-04-10","2024-04-22","2024-05-15","2024-06-02"
+    ]),
+    "region": ["North","West","North","South","North","West","South","West"],
+    "fraud_loss": [5000,7000,3000,4000,2000,8000,1000,6000],
+    "transactions": [100,120,90,150,110,130,80,170],
+    "merchant": ["Amazon","Flipkart","Amazon","Myntra","Myntra","Flipkart","Amazon","Amazon"]
+})
+
+schema = {
+    "date": "Date of the transaction",
+    "region": "Geographical region where transaction happened",
+    "fraud_loss": "Amount lost due to fraud in INR",
+    "transactions": "Number of transactions recorded",
+    "merchant": "Name of the merchant where the transaction occurred"
+}
+
+# --------------------------
+# 3. Intent Extraction Agent
+# --------------------------
+response_schemas = [
+    ResponseSchema(name="fields", description="List of fields to retrieve"),
+    ResponseSchema(name="filters", description="Dictionary of filters e.g. {'region':'North'}"),
+    ResponseSchema(name="group_by", description="List of fields to group by"),
+    ResponseSchema(name="aggregations", description="Dictionary like {'fraud_loss':'sum'}")
+]
+output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+format_instructions = output_parser.get_format_instructions()
+
+query_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an intent extraction agent.
+Dataset schema:
+{schema}
+
+Extract the intent from the user query and return JSON with:
+- fields
+- filters
+- group_by
+- aggregations
+
+{format_instructions}
+"""),
+    ("user", "User Query: {query}")
+])
+
+query_chain = LLMChain(llm=llm, prompt=query_prompt, output_parser=output_parser)
+
+def query_agent(user_query: str):
+    return query_chain.run({
+        "query": user_query,
+        "schema": json.dumps(schema, indent=2),
+        "format_instructions": format_instructions
+    })
+
+# --------------------------
+# 4. SQL Agent
+# --------------------------
+sql_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert SQL query generator. 
+You will receive a natural language question and must output a **SQLite-compatible SQL query**.
+
+Rules:
+1. DO NOT use backticks (`) around identifiers (use plain column/table names instead).
+2. Use only functions supported by SQLite (e.g., SUM, MAX, MIN, AVG, COUNT).
+3. Always SELECT from the table called 'data'.
+4. If grouping, use GROUP BY instead of window functions.
+5. Return only the SQL query, nothing else.
+
+Example:
+Q: Find the top merchant by fraud loss in Q1 2024.
+A:
+SELECT merchant, SUM(fraud_loss) AS total_loss
+FROM data
+WHERE date BETWEEN '2024-01-01' AND '2024-03-31'
+GROUP BY merchant
+ORDER BY total_loss DESC
+LIMIT 1;
+"""),
+    ("user", "Intent: {intent}\n\nSchema: {schema}")
+])
+sql_chain = LLMChain(llm=llm, prompt=sql_prompt)
+
+def sql_agent(intent: dict):
+    return sql_chain.run({
+        "intent": json.dumps(intent, indent=2),
+        "schema": json.dumps(schema, indent=2)
+    })
+
+# --------------------------
+# 5. Data Agent
+# --------------------------
+def data_agent(sql: str, data: pd.DataFrame) -> pd.DataFrame:
+    try:
+        return psql.sqldf(sql, locals())
+    except Exception as e:
+        return pd.DataFrame({"error": [str(e)], "query": [sql]})
+
+# --------------------------
+# 6. Summary Agent
+# --------------------------
+summary_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a summarization agent. Present results as a markdown table + short insights."),
+    ("user", "User asked: {query}\n\nHere is the data:\n{data_table}")
+])
+summary_chain = LLMChain(llm=llm, prompt=summary_prompt)
+
+def summary_agent(result_df: pd.DataFrame, user_query: str):
+    if result_df.empty:
+        return f"No results found for query: {user_query}"
+    table_text = result_df.to_markdown(index=False)
+    return summary_chain.run({"query": user_query, "data_table": table_text})
+
+# --------------------------
+# 7. Orchestrator
+# --------------------------
+def run_pipeline(user_query: str):
+    # Intent
+    intent = query_agent(user_query)
+    intent = json.loads(intent) if isinstance(intent, str) else intent
+
+    # SQL
+    sql_query = sql_agent(intent).strip()
+
+    # Execute
+    extracted = data_agent(sql_query, data)
+
+    # Summarize
+    summary = summary_agent(extracted, user_query)
+
+    # Debug prints
+    print("\n--- USER QUERY ---")
+    print(user_query)
+#     print("\n--- INTENT ---")
+#     print(intent)
+    print("\n--- SQL QUERY ---")
+    print(sql_query)
+    print("\n--- EXTRACTED DATA ---")
+    print(extracted)
+    print("\n--- SUMMARY ---")
+    print(summary)
+
+# --------------------------
+# 8. Test Run
+# --------------------------
+run_pipeline("Create a region wise fraud loss for every merchant in q2 2024 want regions in columnns")
+# run_pipeline("List all transactions for Amazon in Q2 2024 with fraud_loss")
+# run_pipeline("What is the count of transactions by merchant?")
